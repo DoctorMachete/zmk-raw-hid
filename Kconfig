@@ -17,4 +17,15 @@ config RAW_HID_REPORT_SIZE
 
 config RAW_HID_DEVICE
     string "Raw HID Device"
-    default HID_1
+    default "HID_1"
+
+config RAW_HID_ENABLE_RECEIVE
+    bool "Enable Raw HID receive path (host -> keyboard)"
+    depends on RAW_HID
+    default n
+    help
+      When disabled (default), the keyboard accepts but discards reports sent
+      from the host over both USB and BLE. The raw_hid_received_event is not
+      raised. This eliminates a class of bugs where listeners would receive
+      pointers to transient USB/BT stack buffers. Enable only if you actually
+      have a consumer of the receive event.
