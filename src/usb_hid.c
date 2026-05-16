@@ -58,25 +58,21 @@ static const struct hid_ops ops = {
     .set_report = set_report_cb,
 };
 
+/* USB path is left as-is from the original implementation. hid_int_ep_write
+ * copies the data into the USB driver's buffer before returning, so the
+ * stack-local `report[]` is safe (unlike the BT path, which is why BT
+ * needed the work-queue deferral in hog.c). The 30ms semaphore block was
+ * already present in the original code and did not cause the sticky-layer
+ * issue on its own. */
+
 static void send_report(const uint8_t *data, uint8_t len) {
-    /* If a prior send is still draining, wait briefly. If it never completes
-     * (host detached, endpoint stalled), drop this report rather than blocking
-     * the caller. The original code used K_MSEC(30) then unconditionally
-     * called hid_int_ep_write even on semaphore timeout; that meant a stalled
-     * endpoint would slowly accumulate 30ms blocks on every send. */
-    if (k_sem_take(&hid_sem, K_MSEC(30)) != 0) {
-        LOG_DBG("USB Raw HID busy, dropping report");
-        return;
-    }
+    k_sem_take(&hid_sem, K_MSEC(30));
 
     LOG_INF("USB - Sending Raw HID report of length %i", len);
     uint8_t report[CONFIG_RAW_HID_REPORT_SIZE] = {0};
     memcpy(report, data, len);
     LOG_HEXDUMP_DBG(report, CONFIG_RAW_HID_REPORT_SIZE, "USB - Sending Raw HID report");
 
-    /* Note: hid_int_ep_write copies the data into the USB driver's own buffer
-     * before returning, so a stack-local `report` is safe here -- in contrast
-     * to bt_gatt_notify_cb which only queues a pointer. */
     int err = hid_int_ep_write(raw_hid_dev, report, CONFIG_RAW_HID_REPORT_SIZE, NULL);
     if (err) {
         LOG_ERR("Failed to send report: %i", err);
