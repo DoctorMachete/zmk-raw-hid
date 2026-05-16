@@ -5,6 +5,7 @@
 
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/kernel.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -83,8 +84,7 @@ static ssize_t write_hids_raw_hid_report(struct bt_conn *conn, const struct bt_g
     return len;
 }
 #else
-/* Receive path disabled - just acknowledge writes and drop data.
- * Avoids passing a pointer to a transient BT stack buffer to listeners. */
+/* Receive path disabled - just acknowledge writes and drop data. */
 static ssize_t write_hids_raw_hid_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                          const void *buf, uint16_t len, uint16_t offset,
                                          uint8_t flags) {
@@ -139,79 +139,113 @@ BT_GATT_SERVICE_DEFINE(
                            BT_GATT_PERM_WRITE, NULL, write_ctrl_point, &ctrl_point));
 
 /* ---------------------------------------------------------------------------
- * Notify send path
+ * Deferred notify path
  *
- * Original bug:
- *   send_report() built `report[]` on the stack and passed `&report` to
- *   bt_gatt_notify_cb(). That function is ASYNC: it queues the notification
- *   and returns immediately, while `report` goes out of scope. The BT host
- *   thread later reads from a freed stack location to transmit. Result:
- *   intermittent memory corruption that eventually wedges the BLE stack and
- *   requires a power cycle. This is the keyboard-freeze cause.
+ * Background:
  *
- * Fix:
- *   - TX buffer is file-static, kept alive across the async send.
- *   - A semaphore serialises sends; the notify completion callback releases
- *     it so we never overwrite an in-flight buffer.
- *   - On error / no-connection / timeout we release the semaphore so the
- *     next send isn't blocked.
+ *   Original bug:  send_report() built a stack-local `report[]` and passed
+ *                  `&report` to bt_gatt_notify_cb(). Although modern Zephyr
+ *                  copies params->data into an ATT PDU before returning,
+ *                  there are still subtle issues with calling the BT host
+ *                  from event listeners (notably: the call can block on the
+ *                  ATT tx semaphore if the host is busy), and the original
+ *                  shared static buffer pattern in the layer-notifier could
+ *                  be clobbered between back-to-back events.
+ *
+ *   v1 attempt:    Added a static buffer + a semaphore taken before send and
+ *                  released by a notify-completion callback. This had the
+ *                  unintended side effect of blocking the keymap thread for
+ *                  up to 50ms per send, which broke timing-sensitive
+ *                  sticky-layer / conditional-layer sequences.
+ *
+ *   v2 (this fix): Decouple completely. The event listener runs on the
+ *                  keymap thread, copies the payload into a thread-safe
+ *                  message queue, and returns. A dedicated work-queue
+ *                  thread (raw_hog_work_q, declared but unused in the
+ *                  original) drains the queue and performs the actual BT
+ *                  notify call. The keymap thread NEVER blocks on BT.
+ *
+ * Queue depth: 4 messages is plenty. Layer changes happen at most a few
+ * tens per second; BT notify is single-digit ms. If the queue fills (e.g.
+ * BT link congested), excess reports are dropped on the producer side,
+ * which is the right behaviour: dropping is preferable to blocking the
+ * keymap.
  * ------------------------------------------------------------------------- */
 
-static uint8_t tx_report[CONFIG_RAW_HID_REPORT_SIZE];
-static struct bt_gatt_notify_params tx_notify_params;
-static K_SEM_DEFINE(tx_sem, 1, 1);
+#define TX_QUEUE_DEPTH 4
 
-static void notify_complete_cb(struct bt_conn *conn, void *user_data) {
-    ARG_UNUSED(conn);
-    ARG_UNUSED(user_data);
-    k_sem_give(&tx_sem);
-}
+struct tx_msg {
+    uint8_t data[CONFIG_RAW_HID_REPORT_SIZE];
+};
 
-static void send_report(const uint8_t *data, uint8_t len) {
-    struct bt_conn *conn = zmk_ble_active_profile_conn();
-    if (conn == NULL) {
-        LOG_DBG("Not connected to active profile, dropping raw HID report");
-        return;
-    }
+K_MSGQ_DEFINE(tx_msgq, sizeof(struct tx_msg), TX_QUEUE_DEPTH, 4);
 
-    /* Bounded wait: if the previous notify hasn't completed in 50ms, the link
-     * is probably degraded. Drop this report rather than block the caller
-     * (which may be the BLE thread itself). */
-    if (k_sem_take(&tx_sem, K_MSEC(50)) != 0) {
-        LOG_WRN("Previous raw HID notify still pending, dropping");
+K_THREAD_STACK_DEFINE(raw_hog_q_stack, CONFIG_ZMK_BLE_THREAD_STACK_SIZE);
+struct k_work_q raw_hog_work_q;
+static struct k_work tx_drain_work;
+
+static void tx_drain_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    struct tx_msg msg;
+
+    /* Drain everything currently queued. We re-arm via k_work_submit_to_queue
+     * if more arrives while we're processing; k_work handles the
+     * already-pending case safely. */
+    while (k_msgq_get(&tx_msgq, &msg, K_NO_WAIT) == 0) {
+        struct bt_conn *conn = zmk_ble_active_profile_conn();
+        if (conn == NULL) {
+            LOG_DBG("Not connected to active profile, dropping raw HID report");
+            continue;
+        }
+
+        struct bt_gatt_notify_params notify_params = {
+            .attr = &raw_hog_svc.attrs[5],
+            .data = msg.data,
+            .len = CONFIG_RAW_HID_REPORT_SIZE,
+            .func = NULL,
+            .user_data = NULL,
+        };
+
+        LOG_INF("BT - Sending Raw HID report");
+        LOG_HEXDUMP_DBG(msg.data, sizeof(msg.data), "BT - Sending Raw HID report");
+
+        int err = bt_gatt_notify_cb(conn, &notify_params);
+        if (err == -EPERM) {
+            bt_conn_set_security(conn, BT_SECURITY_L2);
+        } else if (err) {
+            LOG_DBG("Raw HID notify error %d", err);
+        }
+        /* notify_params (and msg.data) are no longer referenced after
+         * bt_gatt_notify_cb returns -- Zephyr copies the payload into the
+         * ATT PDU before returning. */
+
         bt_conn_unref(conn);
-        return;
     }
-
-    LOG_INF("BT - Sending Raw HID report of length %i", len);
-    memset(tx_report, 0, sizeof(tx_report));
-    memcpy(tx_report, data, MIN(len, sizeof(tx_report)));
-    LOG_HEXDUMP_DBG(tx_report, sizeof(tx_report), "BT - Sending Raw HID report");
-
-    tx_notify_params.attr = &raw_hog_svc.attrs[5];
-    tx_notify_params.data = tx_report;
-    tx_notify_params.len = sizeof(tx_report);
-    tx_notify_params.func = notify_complete_cb;
-    tx_notify_params.user_data = NULL;
-
-    int err = bt_gatt_notify_cb(conn, &tx_notify_params);
-    if (err == -EPERM) {
-        bt_conn_set_security(conn, BT_SECURITY_L2);
-        k_sem_give(&tx_sem);
-    } else if (err) {
-        LOG_ERR("Raw HID notify error %d", err);
-        k_sem_give(&tx_sem);
-    }
-    /* Success: tx_sem is released by notify_complete_cb when BT host is done. */
-
-    bt_conn_unref(conn);
 }
 
 static int raw_hid_sent_event_listener(const zmk_event_t *eh) {
     struct raw_hid_sent_event *event = as_raw_hid_sent_event(eh);
-    if (event) {
-        send_report(event->data, event->length);
+    if (!event) {
+        return ZMK_EV_EVENT_BUBBLE;
     }
+
+    struct tx_msg msg;
+    memset(msg.data, 0, sizeof(msg.data));
+    memcpy(msg.data, event->data, MIN(event->length, sizeof(msg.data)));
+
+    /* Non-blocking put: if the queue is full we drop. This must NEVER
+     * block, since this listener runs on the keymap thread and any block
+     * here would delay sticky-layer / conditional-layer state machines. */
+    int ret = k_msgq_put(&tx_msgq, &msg, K_NO_WAIT);
+    if (ret != 0) {
+        LOG_WRN("Raw HID TX queue full, dropping report");
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    /* Wake the drain worker. If it's already pending or running, this is
+     * a no-op; if it's idle, this schedules it. Either way, the work will
+     * eventually run and drain everything we've just put. */
+    k_work_submit_to_queue(&raw_hog_work_q, &tx_drain_work);
 
     return ZMK_EV_EVENT_BUBBLE;
 }
@@ -219,12 +253,10 @@ static int raw_hid_sent_event_listener(const zmk_event_t *eh) {
 ZMK_LISTENER(bt_process_raw_hid_sent_event, raw_hid_sent_event_listener);
 ZMK_SUBSCRIPTION(bt_process_raw_hid_sent_event, raw_hid_sent_event);
 
-K_THREAD_STACK_DEFINE(raw_hog_q_stack, CONFIG_ZMK_BLE_THREAD_STACK_SIZE);
-
-struct k_work_q raw_hog_work_q;
-
 static int raw_hog_init(void) {
-    static const struct k_work_queue_config queue_config = {.name = "HID Over GATT Send Work"};
+    k_work_init(&tx_drain_work, tx_drain_work_handler);
+
+    static const struct k_work_queue_config queue_config = {.name = "raw_hog_q"};
     k_work_queue_start(&raw_hog_work_q, raw_hog_q_stack, K_THREAD_STACK_SIZEOF(raw_hog_q_stack),
                        CONFIG_ZMK_BLE_THREAD_PRIORITY, &queue_config);
 
